@@ -1,6 +1,6 @@
 # ETT Lab Project
 
-## AI-Driven Sustainability Report Analyzer
+## AI-Driven BRSR/ESG Report Analyzer
 
 ### Project Description
 Corporate sustainability and ESG (Environmental, Social, and Governance) reporting has become mandatory for many listed companies. These reports are usually published as long and unstructured documents, making manual extraction and analysis time-consuming and inefficient.
