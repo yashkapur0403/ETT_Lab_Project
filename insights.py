@@ -99,17 +99,26 @@ def detect_gaps(metrics: ESGMetrics) -> list[Gap]:
 
 # Task 13
 def build_insight_prompt(metrics, score, gaps, narrative_context: str) -> str:
+    def fmt(value, suffix=""):
+        if value is None:
+            return "Not disclosed"
+        return f"{value}{suffix}"
+
     gap_summary = "\n".join(f"- [{g.severity.upper()}] {g.message}" for g in gaps[:6])
     return f"""You are a senior ESG analyst. Analyze this company's ESG performance and provide actionable insights.
+
+COMPANY: {metrics.company_name or "Unknown company"}
+REPORTING YEAR: {metrics.reporting_year or "Not disclosed"}
 
 ESG SCORES: Environmental={score.environmental:.0f}/100, Social={score.social:.0f}/100, Governance={score.governance:.0f}/100, Overall={score.overall:.0f}/100 (Grade {score.grade})
 
 KEY METRICS:
-- GHG Scope 1+2: {metrics.ghg_scope1} + {metrics.ghg_scope2} tCO2e
-- Renewable Energy: {metrics.renewable_energy_pct}%
-- Women Employees: {metrics.women_employees_pct}%
-- Board Independence: {metrics.independent_directors_pct}%
-- LTIFR: {metrics.lost_time_injury_rate}
+- GHG Scope 1: {fmt(metrics.ghg_scope1, " tCO2e")}
+- GHG Scope 2: {fmt(metrics.ghg_scope2, " tCO2e")}
+- Renewable Energy: {fmt(metrics.renewable_energy_pct, "%")}
+- Women Employees: {fmt(metrics.women_employees_pct, "%")}
+- Board Independence: {fmt(metrics.independent_directors_pct, "%")}
+- LTIFR: {fmt(metrics.lost_time_injury_rate)}
 
 DISCLOSURE GAPS:
 {gap_summary}
@@ -164,17 +173,10 @@ def parse_insight_sections(llm_response: str) -> tuple[list[str], list[str], lis
         red_flags = extract_section(llm_response, "RED FLAGS")
         recommendations = extract_section(llm_response, "RECOMMENDATIONS")
         
-        if not highlights:
-            highlights = ["No highlights extracted"]
-        if not red_flags:
-            red_flags = ["No risks detected"]
-        if not recommendations:
-            recommendations = ["No recommendations available"]
-            
         return highlights, red_flags, recommendations
     except Exception as e:
         print(f"   ❌ Parse Error - {e}")
-        return ["No highlights extracted"], ["No risks detected"], ["No recommendations available"]
+        return [], [], []
 
 
 # Task 15
