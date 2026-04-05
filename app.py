@@ -205,18 +205,17 @@ def main():
         # Step 4: Extract metrics
         with st.spinner("📊 Extracting ESG metrics from report..."):
             metrics = extract_esg_metrics(vectorstore, llm_token, tagged_lines)
-            # Check if any key metrics were actually extracted
-            has_data = any([
-                metrics.ghg_scope1 is not None,
-                metrics.ghg_scope2 is not None,
-                metrics.total_employees is not None,
-                metrics.board_size is not None,
-                metrics.company_name is not None
-            ])
+            populated_fields = sum(
+                1 for field_name, value in vars(metrics).items()
+                if field_name != "raw_text_sample" and value is not None
+            )
+            has_data = populated_fields > 0
             if not has_data:
                 st.warning("⚠️ **Limited data extracted**: The report may not contain structured ESG metrics, or LLM extraction encountered issues. Results below are based on available data.")
+            elif populated_fields < 6:
+                st.warning(f"⚠️ **Partial extraction only**: Found {populated_fields} populated fields. Insights may be directionally useful, but not complete.")
             else:
-                st.success(f"✅ Extracted metrics for {metrics.company_name or 'company'}")
+                st.success(f"✅ Extracted {populated_fields} fields for {metrics.company_name or 'company'}")
 
         # Step 5: Generate insights
         with st.spinner("💡 Generating AI-powered insights..."):
