@@ -212,16 +212,35 @@ def _merge_broken_lines(lines: list[str]) -> list[str]:
             if line and next_line:
                 last_char = line[-1]
                 first_char = next_line[0]
+                current_words = len(line.split())
+                next_words = len(next_line.split())
+
+                # Do not merge lines that already look like full records, tables, or numbered items.
+                if (
+                    current_words >= 6 or
+                    len(line) >= 120 or
+                    re.match(r'^\d+[\.\)]\s', next_line) or
+                    re.match(r'^(?:[A-Z][A-Z\s/&-]{4,}|[IVX]+\.)$', line) or
+                    re.search(r':\s*$', line) or
+                    sum(ch.isdigit() for ch in line) >= 6
+                ):
+                    should_merge = False
+                    break
                 
                 # If current line is a single short word or a number
-                if len(line.split()) <= 2 or re.match(r'^\d+', line):
+                if current_words <= 2 or re.match(r'^\d+$', line):
                     # Merge with next line if it contains text or numbers
-                    if re.match(r'^[a-z\d]', next_line, re.IGNORECASE):
+                    if re.match(r'^[a-z\d]', next_line, re.IGNORECASE) and next_words <= 12:
                         should_merge = True
                 
                 # If line ends with operator or number, and next starts with number/unit
                 if re.match(r'[=:,\-]$', last_char) or last_char.isdigit():
                     if first_char.isdigit() or first_char == '%':
+                        should_merge = True
+
+                # Merge common heading continuations like "Total" + "Employees"
+                if current_words <= 4 and next_words <= 6 and len(line) + len(next_line) <= 80:
+                    if re.match(r'^[A-Za-z(]', first_char) and not re.search(r'[.!?]$', line):
                         should_merge = True
             
             if should_merge:
@@ -389,6 +408,10 @@ def preprocess_pdf_text(raw_text: str, max_chars: int = 20000) -> tuple[str, lis
             relevant_lines.append(line)
     
     print(f"      ✓ {len(relevant_lines)} lines after relevance filter")
+    if not relevant_lines:
+        fallback_lines = [line for line in normalized if len(line.split()) >= 3]
+        relevant_lines = fallback_lines[:200]
+        print(f"      ⚠️  No ESG-specific lines found, using {len(relevant_lines)} normalized fallback lines")
     
     # STEP 6: Build cleaned text for embedding
     print("   🔄 Step 6: Building cleaned text...")
@@ -467,14 +490,15 @@ def process_pdf(file_bytes: bytes, chunk_size: int = 600, overlap: int = 100) ->
     if not words:
         raise ValueError("PDF is unreadable or contains no extractable text after preprocessing.")
 
-    # Character-based chunking for better semantic boundaries
+    # Word-based chunking keeps overlap predictable and retrieval stable.
     chunks = []
-    text = " ".join(words)
     step = chunk_size - overlap
+    if step <= 0:
+        raise ValueError("chunk_size must be greater than overlap.")
     
-    for i in range(0, len(text), step):
-        chunk = text[i:i + chunk_size].strip()
-        if len(chunk) > 50:  # Only keep meaningful chunks
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + chunk_size]).strip()
+        if len(chunk.split()) > 10:
             chunks.append(chunk)
 
     print(f"📦 Created {len(chunks)} optimized chunks (chunk_size={chunk_size}, overlap={overlap})")
@@ -620,24 +644,38 @@ def retrieve_for_metric_with_tags(
 
 # Task 6
 def build_extraction_prompt(context: str) -> str:
-    return f"""Extract ONLY these 5 critical ESG metrics. Return ONLY valid JSON, nothing else.
+    return f"""Extract ESG metrics from the context below. Return ONLY valid JSON, nothing else.
 
-For any metric not found, use null. Return only numbers (no units).
+For any metric not found, use null. Return only numbers without units.
 
-```json
+Use this exact schema:
 {{
   "company_name": null or string,
+  "reporting_year": null or string,
+  "framework": null or string,
   "ghg_scope1": null or number,
+  "ghg_scope2": null or number,
+  "energy_consumption": null or number,
+  "renewable_energy_pct": null or number,
+  "water_withdrawal": null or number,
+  "waste_generated": null or number,
+  "waste_recycled_pct": null or number,
   "total_employees": null or number,
   "women_employees_pct": null or number,
-  "board_size": null or number
+  "training_hours_avg": null or number,
+  "lost_time_injury_rate": null or number,
+  "csr_spend": null or number,
+  "board_size": null or number,
+  "independent_directors_pct": null or number,
+  "women_directors_pct": null or number,
+  "audit_committee_independent": null or boolean,
+  "whistleblower_policy": null or boolean
 }}
-```
 
 CONTEXT:
 {context}
 
-Return ONLY JSON in code blocks:"""
+Return ONLY JSON:"""
 
 
 # Task 7
@@ -689,6 +727,7 @@ def parse_metrics_from_llm_output(raw: str) -> ESGMetrics:
         print(f"   Cleaned JSON length: {len(json_str)} chars")
         print(f"   JSON preview: {json_str[:100]}...")
         
+        json_str = _clean_json_numbers(json_str)
         data = json.loads(json_str)
         print(f"✅ Successfully parsed JSON with {len(data)} keys")
 
@@ -710,7 +749,7 @@ def parse_metrics_from_llm_output(raw: str) -> ESGMetrics:
             if v is None or v == "null" or v == "":
                 return None
             try:
-                v_str = str(v).strip()
+                v_str = _clean_json_numbers(str(v).strip())
                 match_num = re.search(r'\d+', v_str)
                 if match_num:
                     return int(match_num.group())
@@ -724,22 +763,53 @@ def parse_metrics_from_llm_output(raw: str) -> ESGMetrics:
                 return None
             return str(v).strip() if v else None
 
-        # Extract only the 5 critical fields
+        def _bool(key):
+            v = data.get(key)
+            if v is None or v == "null" or v == "":
+                return None
+            if isinstance(v, bool):
+                return v
+            v_str = str(v).strip().lower()
+            if v_str in {"true", "yes", "y", "1", "present", "available", "independent"}:
+                return True
+            if v_str in {"false", "no", "n", "0", "absent", "not available", "not disclosed"}:
+                return False
+            return None
+
         metrics = ESGMetrics(
             company_name=_str("company_name"),
+            reporting_year=_str("reporting_year"),
+            framework=_str("framework"),
             ghg_scope1=_float("ghg_scope1"),
+            ghg_scope2=_float("ghg_scope2"),
+            energy_consumption=_float("energy_consumption"),
+            renewable_energy_pct=_float("renewable_energy_pct"),
+            water_withdrawal=_float("water_withdrawal"),
+            waste_generated=_float("waste_generated"),
+            waste_recycled_pct=_float("waste_recycled_pct"),
             total_employees=_int("total_employees"),
             women_employees_pct=_float("women_employees_pct"),
+            training_hours_avg=_float("training_hours_avg"),
+            lost_time_injury_rate=_float("lost_time_injury_rate"),
+            csr_spend=_float("csr_spend"),
             board_size=_int("board_size"),
+            independent_directors_pct=_float("independent_directors_pct"),
+            women_directors_pct=_float("women_directors_pct"),
+            audit_committee_independent=_bool("audit_committee_independent"),
+            whistleblower_policy=_bool("whistleblower_policy"),
         )
         
         # Show what was extracted
         extracted = {k: v for k, v in {
             "company_name": metrics.company_name,
             "ghg_scope1": metrics.ghg_scope1,
+            "ghg_scope2": metrics.ghg_scope2,
+            "renewable_energy_pct": metrics.renewable_energy_pct,
             "total_employees": metrics.total_employees,
             "women_employees_pct": metrics.women_employees_pct,
             "board_size": metrics.board_size,
+            "independent_directors_pct": metrics.independent_directors_pct,
+            "whistleblower_policy": metrics.whistleblower_policy,
         }.items() if v is not None}
         
         print(f"✅ Extracted metrics: {extracted}")
@@ -1125,76 +1195,350 @@ JSON ONLY:"""
 
 # Task 9
 EXTRACTION_QUERIES = {
-    "company": "company name organization",
-    "ghg_scope1": "Scope 1 GHG emissions tonnes CO2e",
-    "employees": "total employees headcount workforce",
-    "women": "women employees percentage female workforce",
-    "board": "board size directors number",
+    "company": "company name reporting year framework BRSR ESG report annual report",
+    "emissions": "Scope 1 Scope 2 GHG emissions carbon tCO2e tonnes",
+    "resources": "energy consumption renewable energy water withdrawal waste recycled",
+    "workforce": "total employees women employees training hours LTIFR csr spend safety",
+    "governance": "board size independent directors women directors audit committee whistleblower policy",
 }
+
+
+def _collect_extraction_context(vectorstore, tagged_lines: list[dict] | None, max_chars: int = 5000) -> str:
+    snippets = []
+    seen = set()
+
+    if tagged_lines:
+        for item in tagged_lines[:24]:
+            text = item.get("text", "").strip()
+            if text and text not in seen:
+                snippets.append(text)
+                seen.add(text)
+
+    for query in EXTRACTION_QUERIES.values():
+        for chunk in retrieve(vectorstore, query, k=2):
+            chunk = chunk.strip()
+            if chunk and chunk not in seen:
+                snippets.append(chunk)
+                seen.add(chunk)
+
+    context = ""
+    for snippet in snippets:
+        if len(context) + len(snippet) + 1 > max_chars:
+            break
+        context += snippet + "\n"
+
+    return context.strip()
+
+
+def _extract_numbers_from_text(text: str) -> list[float]:
+    numbers = []
+    for match in re.findall(r'\d[\d,]*\.?\d*', text):
+        cleaned = match.replace(",", "")
+        try:
+            numbers.append(float(cleaned))
+        except ValueError:
+            continue
+    return numbers
+
+
+def _find_best_tagged_line(tagged_lines: list[dict] | None, include: list[str], exclude: list[str] | None = None) -> str | None:
+    if not tagged_lines:
+        return None
+
+    exclude = exclude or []
+    best_line = None
+    best_score = float("-inf")
+
+    for item in tagged_lines:
+        text = item.get("text", "").strip()
+        if not text:
+            continue
+
+        text_lower = text.lower()
+        if any(term in text_lower for term in exclude):
+            continue
+        if not all(term in text_lower for term in include):
+            continue
+
+        numbers = _extract_numbers_from_text(text)
+        score = 0
+        score += len(numbers) * 2
+        score += 25 if "total" in text_lower else 0
+        score += 20 if "%" in text else 0
+        score += max(numbers) / 1000 if numbers else 0
+        score -= len(text) / 25
+
+        if score > best_score:
+            best_score = score
+            best_line = text
+
+    return best_line
+
+
+def _extract_total_employee_metrics_from_tagged_lines(tagged_lines: list[dict] | None) -> tuple[int | None, float | None]:
+    if not tagged_lines:
+        return None, None
+
+    candidates = []
+    for item in tagged_lines:
+        text = item.get("text", "").strip()
+        if not text:
+            continue
+        text_lower = text.lower()
+        if "total employees" not in text_lower:
+            continue
+        if any(term in text_lower for term in ["differently abled", "board", "kmp", "senior management", "workers", "turnover rate"]):
+            continue
+
+        numbers = _extract_numbers_from_text(text)
+        if len(numbers) < 4:
+            continue
+        if numbers[0] <= 10 and len(numbers) >= 5:
+            numbers = numbers[1:]
+        if len(numbers) < 4:
+            continue
+
+        total = numbers[0]
+        women_pct = None
+        percent_values = [n for n in numbers if 0 <= n <= 100 and abs(n - round(n, 1)) <= 100]
+        if percent_values:
+            women_pct = percent_values[-1]
+
+        if total >= 100 and women_pct is not None:
+            candidates.append((int(total), float(women_pct), text))
+
+    if not candidates:
+        return None, None
+
+    # Prefer the largest plausible overall workforce row.
+    total, women_pct, _ = max(candidates, key=lambda item: item[0])
+    return total, women_pct
+
+
+def _extract_board_metrics_from_tagged_lines(tagged_lines: list[dict] | None) -> tuple[int | None, float | None]:
+    line = _find_best_tagged_line(
+        tagged_lines,
+        include=["board", "directors"],
+        exclude=["committee", "training", "complaints", "value chain", "independent director,"],
+    )
+    if not line:
+        return None, None
+
+    numbers = _extract_numbers_from_text(line)
+    if len(numbers) < 3:
+        return None, None
+
+    board_size = None
+    women_pct = None
+    for idx, number in enumerate(numbers):
+        if board_size is None and 3 <= number <= 30 and float(number).is_integer():
+            board_size = int(number)
+            if idx + 2 < len(numbers) and 0 <= numbers[idx + 2] <= 100:
+                women_pct = float(numbers[idx + 2])
+            break
+
+    return board_size, women_pct
+
+
+def _extract_metric_by_keywords(
+    tagged_lines: list[dict] | None,
+    include: list[str],
+    exclude: list[str] | None = None,
+    *,
+    require_unit: list[str] | None = None,
+    validator=None,
+) -> float | None:
+    line = _find_best_tagged_line(tagged_lines, include=include, exclude=exclude)
+    if not line:
+        return None
+
+    line_lower = line.lower()
+    if require_unit and not any(unit in line_lower for unit in require_unit):
+        return None
+
+    numbers = _extract_numbers_from_text(line)
+    for number in numbers:
+        if validator is None or validator(number, line_lower):
+            return float(number)
+    return None
+
+
+def _extract_boolean_disclosure(tagged_lines: list[dict] | None, phrase_options: list[str]) -> bool | None:
+    if not tagged_lines:
+        return None
+
+    for item in tagged_lines:
+        text = item.get("text", "").strip().lower()
+        if any(phrase in text for phrase in phrase_options):
+            if "no " in text[:3] or "not " in text:
+                return False
+            return True
+    return None
+
+
+def _extract_company_name_from_tagged_lines(tagged_lines: list[dict] | None) -> str | None:
+    if not tagged_lines:
+        return None
+
+    for item in tagged_lines:
+        text = item.get("text", "").strip()
+        text_lower = text.lower()
+        if "name of the listed entity" in text_lower:
+            parts = re.split(r'name of the listed entity', text, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                candidate = parts[1].strip(" :.-")
+                candidate = re.split(r'\s{2,}| \d+\.', candidate)[0].strip()
+                if candidate:
+                    return candidate
+    return None
+
+
+def _apply_metric_validations(metrics: ESGMetrics, tagged_lines: list[dict] | None) -> ESGMetrics:
+    total_employees, women_employees_pct = _extract_total_employee_metrics_from_tagged_lines(tagged_lines)
+    board_size, women_directors_pct = _extract_board_metrics_from_tagged_lines(tagged_lines)
+    company_name = _extract_company_name_from_tagged_lines(tagged_lines)
+
+    if total_employees is not None:
+        metrics.total_employees = total_employees
+    if women_employees_pct is not None:
+        metrics.women_employees_pct = women_employees_pct
+    if board_size is not None:
+        metrics.board_size = board_size
+    if women_directors_pct is not None:
+        metrics.women_directors_pct = women_directors_pct
+    if company_name:
+        metrics.company_name = company_name
+
+    scope1 = _extract_metric_by_keywords(
+        tagged_lines,
+        include=["scope 1"],
+        exclude=["scope 2", "intensity", "rate"],
+        require_unit=["tco2", "co2", "tonnes"],
+        validator=lambda number, _: number >= 50,
+    )
+    if scope1 is not None:
+        metrics.ghg_scope1 = scope1
+    elif metrics.ghg_scope1 is not None and metrics.ghg_scope1 < 50:
+        metrics.ghg_scope1 = None
+
+    scope2 = _extract_metric_by_keywords(
+        tagged_lines,
+        include=["scope 2"],
+        exclude=["scope 1", "intensity", "rate"],
+        require_unit=["tco2", "co2", "tonnes"],
+        validator=lambda number, _: number >= 50,
+    )
+    if scope2 is not None:
+        metrics.ghg_scope2 = scope2
+
+    energy = _extract_metric_by_keywords(
+        tagged_lines,
+        include=["energy"],
+        exclude=["renewable energy", "%", "intensity", "ratio"],
+        require_unit=["gj", "kwh", "mwh"],
+        validator=lambda number, line: number >= 100 or "mwh" in line or "gj" in line or "kwh" in line,
+    )
+    if energy is not None:
+        metrics.energy_consumption = energy
+    elif metrics.energy_consumption is not None and metrics.energy_consumption < 100:
+        metrics.energy_consumption = None
+
+    water = _extract_metric_by_keywords(
+        tagged_lines,
+        include=["water"],
+        exclude=["intensity", "%", "ratio"],
+        require_unit=["kl", "m3", "m³", "kilolitre"],
+        validator=lambda number, _: number >= 100,
+    )
+    if water is not None:
+        metrics.water_withdrawal = water
+
+    whistleblower = _extract_boolean_disclosure(tagged_lines, ["whistle blower policy", "whistleblower policy"])
+    if whistleblower is not None:
+        metrics.whistleblower_policy = whistleblower
+
+    independent_directors_pct = _extract_metric_by_keywords(
+        tagged_lines,
+        include=["independent", "director"],
+        exclude=["chairman", "committee", "joined", "non-executive independent director"],
+        validator=lambda number, _: 0 <= number <= 100,
+    )
+    if independent_directors_pct is not None:
+        metrics.independent_directors_pct = independent_directors_pct
+    elif metrics.independent_directors_pct is not None and metrics.independent_directors_pct == metrics.women_directors_pct:
+        metrics.independent_directors_pct = None
+
+    if metrics.total_employees is not None and metrics.total_employees < 50:
+        metrics.total_employees = None
+    if metrics.board_size is not None and not (3 <= metrics.board_size <= 30):
+        metrics.board_size = None
+    if metrics.women_employees_pct is not None and not (0 <= metrics.women_employees_pct <= 100):
+        metrics.women_employees_pct = None
+    if metrics.women_directors_pct is not None and not (0 <= metrics.women_directors_pct <= 100):
+        metrics.women_directors_pct = None
+
+    return metrics
 
 
 def extract_esg_metrics(vectorstore, llm_token: str, tagged_lines: list[dict] = None) -> ESGMetrics:
     """
-    Production-grade metric extraction using 6 dedicated functions with TAG-BASED RETRIEVAL.
-    
-    ARCHITECTURE:
-    - Each metric: TAG-FIRST retrieval (filter by ESG tag, keyword boost, sort by relevance)
-    - Each metric: FAISS fallback if no tagged lines found
-    - Each metric: max_tokens=800, temperature=0.1
-    - Each metric: Strict JSON format with retry logic
-    - All metrics: Independent LLM calls (no truncation)
-    
-    HARD LIMITS:
-    - Context: <500 chars per metric (tag-based) or <2000 (FAISS fallback)
-    - Tokens: 800 max
-    - Retries: 1 (total 2 attempts)
+    RAG-based extraction with:
+    - tagged-line context from preprocessing
+    - semantic retrieval across ESG topics
+    - one structured JSON extraction pass
+    - targeted backfills for key fields when needed
     """
     print("\n" + "=" * 70)
-    print("🔴 PRODUCTION-GRADE METRIC-WISE EXTRACTION (TAG-BASED RETRIEVAL)")
+    print("🔴 RAG-BASED ESG METRIC EXTRACTION")
     print("=" * 70)
-    print("   Architecture: 6 independent metric functions + tag-based retrieval")
-    print("   Retrieval: Tag-first filtering with FAISS fallback")
-    print("   Context limit: ~500 chars per metric (tag-based)")
-    print("   Token limit: 800 per metric")
-    print("   Temperature: 0.1 (deterministic)")
-    print("   Retry logic: Yes (1 retry on parse failure)")
+    print("   Retrieval: tagged-line context + semantic FAISS retrieval")
+    print("   Extraction: one JSON schema pass with targeted backfills")
     print("=" * 70)
-    
-    # Extract all 6 metrics independently with tag-based retrieval
-    print("\n🔄 EXTRACTING 6 METRICS WITH TAG-BASED RETRIEVAL...\n")
-    
-    ghg_scope1 = extract_ghg_scope1(vectorstore, llm_token, tagged_lines)
-    energy_consumption = extract_energy(vectorstore, llm_token, tagged_lines)
-    water_withdrawal = extract_water(vectorstore, llm_token, tagged_lines)
-    total_employees = extract_employees(vectorstore, llm_token, tagged_lines)
-    women_employees_pct = extract_diversity(vectorstore, llm_token, tagged_lines)
-    board_size = extract_board(vectorstore, llm_token, tagged_lines)
-    
-    # Create ESGMetrics object with all extracted values
-    metrics = ESGMetrics(
-        ghg_scope1=ghg_scope1,
-        energy_consumption=energy_consumption,
-        water_withdrawal=water_withdrawal,
-        total_employees=total_employees,
-        women_employees_pct=women_employees_pct,
-        board_size=board_size,
+
+    context = _collect_extraction_context(vectorstore, tagged_lines)
+    print(f"\n📦 Combined extraction context: {len(context)} chars")
+    if not context:
+        print("❌ No retrieval context available for extraction")
+        return ESGMetrics()
+
+    prompt = build_extraction_prompt(context)
+    raw = safe_llm_call([{"role": "user", "content": prompt}], max_tokens=1400, llm_token=llm_token)
+    metrics = parse_metrics_from_llm_output(raw) if raw else ESGMetrics()
+    metrics.raw_text_sample = context[:500]
+    metrics = _apply_metric_validations(metrics, tagged_lines)
+
+    backfill_extractors = {
+        "ghg_scope1": extract_ghg_scope1,
+        "energy_consumption": extract_energy,
+        "water_withdrawal": extract_water,
+        "total_employees": extract_employees,
+        "women_employees_pct": extract_diversity,
+        "board_size": extract_board,
+    }
+
+    for field_name, extractor in backfill_extractors.items():
+        if getattr(metrics, field_name) is None:
+            fallback_value = extractor(vectorstore, llm_token, tagged_lines)
+            if fallback_value is not None:
+                setattr(metrics, field_name, fallback_value)
+
+    metrics = _apply_metric_validations(metrics, tagged_lines)
+
+    extracted_count = sum(
+        1 for field_name in ESGMetrics.__dataclass_fields__
+        if field_name != "raw_text_sample" and getattr(metrics, field_name) is not None
     )
     
-    # Summary with detailed logging
-    extracted_count = sum(1 for field in [
-        metrics.ghg_scope1, metrics.energy_consumption, metrics.water_withdrawal,
-        metrics.total_employees, metrics.women_employees_pct, metrics.board_size
-    ] if field is not None)
-    
     print("\n" + "=" * 70)
-    print(f"📊 EXTRACTION COMPLETE: {extracted_count}/6 metrics successfully extracted")
+    print(f"📊 EXTRACTION COMPLETE: {extracted_count} populated fields")
     print("=" * 70)
-    print(f"   GHG Scope 1:          {metrics.ghg_scope1} tCO2e" if metrics.ghg_scope1 else "   GHG Scope 1:          ❌ NOT FOUND")
-    print(f"   Energy Consumption:   {metrics.energy_consumption} GJ" if metrics.energy_consumption else "   Energy Consumption:   ❌ NOT FOUND")
-    print(f"   Water Withdrawal:     {metrics.water_withdrawal} KL" if metrics.water_withdrawal else "   Water Withdrawal:     ❌ NOT FOUND")
-    print(f"   Total Employees:      {metrics.total_employees}" if metrics.total_employees else "   Total Employees:      ❌ NOT FOUND")
-    print(f"   Women Employees %:    {metrics.women_employees_pct}%" if metrics.women_employees_pct else "   Women Employees %:    ❌ NOT FOUND")
-    print(f"   Board Size:           {metrics.board_size}" if metrics.board_size else "   Board Size:           ❌ NOT FOUND")
+    print(f"   Company Name:         {metrics.company_name}" if metrics.company_name else "   Company Name:         ❌ NOT FOUND")
+    print(f"   GHG Scope 1:          {metrics.ghg_scope1} tCO2e" if metrics.ghg_scope1 is not None else "   GHG Scope 1:          ❌ NOT FOUND")
+    print(f"   GHG Scope 2:          {metrics.ghg_scope2} tCO2e" if metrics.ghg_scope2 is not None else "   GHG Scope 2:          ❌ NOT FOUND")
+    print(f"   Renewable Energy %:   {metrics.renewable_energy_pct}%" if metrics.renewable_energy_pct is not None else "   Renewable Energy %:   ❌ NOT FOUND")
+    print(f"   Total Employees:      {metrics.total_employees}" if metrics.total_employees is not None else "   Total Employees:      ❌ NOT FOUND")
+    print(f"   Board Size:           {metrics.board_size}" if metrics.board_size is not None else "   Board Size:           ❌ NOT FOUND")
+    print(f"   Whistleblower Policy: {metrics.whistleblower_policy}" if metrics.whistleblower_policy is not None else "   Whistleblower Policy: ❌ NOT FOUND")
     print("=" * 70 + "\n")
     
     return metrics
