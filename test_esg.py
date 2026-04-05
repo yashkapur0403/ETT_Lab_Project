@@ -12,6 +12,9 @@ from pipeline import (
     retrieve,
     parse_metrics_from_llm_output,
     ESGMetrics,
+    _extract_total_employee_metrics_from_tagged_lines,
+    _extract_board_metrics_from_tagged_lines,
+    _apply_metric_validations,
 )
 from insights import (
     score_metrics,
@@ -52,14 +55,15 @@ def make_mock_embeddings(n_chunks):
 def test_process_pdf_returns_nonempty_chunks():
     text = " ".join([f"word{i}" for i in range(600)])
     with patch("pipeline.PdfReader", return_value=make_mock_reader([text])):
-        chunks = process_pdf(b"fake_pdf_bytes")
+        chunks, tagged_lines = process_pdf(b"fake_pdf_bytes")
     assert len(chunks) > 0
+    assert isinstance(tagged_lines, list)
 
 
 def test_process_pdf_chunk_size():
     text = " ".join([f"word{i}" for i in range(600)])
     with patch("pipeline.PdfReader", return_value=make_mock_reader([text])):
-        chunks = process_pdf(b"fake_pdf_bytes", chunk_size=100, overlap=10)
+        chunks, _ = process_pdf(b"fake_pdf_bytes", chunk_size=100, overlap=10)
     for chunk in chunks:
         assert len(chunk.split()) <= 100
 
@@ -67,7 +71,7 @@ def test_process_pdf_chunk_size():
 def test_process_pdf_overlap():
     text = " ".join([f"word{i}" for i in range(200)])
     with patch("pipeline.PdfReader", return_value=make_mock_reader([text])):
-        chunks = process_pdf(b"fake_pdf_bytes", chunk_size=50, overlap=10)
+        chunks, _ = process_pdf(b"fake_pdf_bytes", chunk_size=50, overlap=10)
     # Adjacent chunks should share words
     if len(chunks) >= 2:
         words0 = chunks[0].split()
@@ -183,6 +187,47 @@ def test_parse_malformed_returns_default():
     assert metrics.ghg_scope1 is None
 
 
+def test_employee_table_parser_prefers_main_total_row():
+    tagged_lines = [
+        {"tag": "SOCIAL_EMP", "text": "3 Total employees (D E) 27 21 77.8% 6 22.2%"},
+        {"tag": "SOCIAL_EMP", "text": "3 Total employees (D E) 75,323 55,752 74.0% 19,571 26.0%"},
+    ]
+    total, women_pct = _extract_total_employee_metrics_from_tagged_lines(tagged_lines)
+    assert total == 75323
+    assert women_pct == 26.0
+
+
+def test_board_table_parser_reads_board_size_and_women_pct():
+    tagged_lines = [
+        {"tag": "GOV_BOARD", "text": "No. (B) % (B/A) Board of Directors 11 3 27.3%"},
+    ]
+    board_size, women_pct = _extract_board_metrics_from_tagged_lines(tagged_lines)
+    assert board_size == 11
+    assert women_pct == 27.3
+
+
+def test_metric_validation_rejects_weak_llm_values():
+    metrics = ESGMetrics(
+        ghg_scope1=10.2,
+        energy_consumption=23.5,
+        women_employees_pct=77.8,
+        total_employees=27,
+        independent_directors_pct=27.3,
+    )
+    tagged_lines = [
+        {"tag": "SOCIAL_EMP", "text": "Name of the Listed Entity Kotak Mahindra Bank Limited"},
+        {"tag": "SOCIAL_EMP", "text": "3 Total employees (D E) 75,323 55,752 74.0% 19,571 26.0%"},
+        {"tag": "GOV_BOARD", "text": "Board of Directors 11 3 27.3%"},
+    ]
+    validated = _apply_metric_validations(metrics, tagged_lines)
+    assert validated.total_employees == 75323
+    assert validated.women_employees_pct == 26.0
+    assert validated.ghg_scope1 is None
+    assert validated.energy_consumption is None
+    assert validated.company_name == "Kotak Mahindra Bank Limited"
+    assert validated.independent_directors_pct is None
+
+
 # ---------------------------------------------------------------------------
 # Task 24: Tests for score_metrics
 # ---------------------------------------------------------------------------
@@ -294,9 +339,9 @@ Some analysis here."""
 
 def test_parse_malformed_returns_empty_lists():
     highlights, red_flags, recommendations = parse_insight_sections("garbage text with no sections")
-    assert highlights == ["No highlights extracted"]
-    assert red_flags == ["No risks detected"]
-    assert recommendations == ["No recommendations available"]
+    assert highlights == []
+    assert red_flags == []
+    assert recommendations == []
 
 
 def test_parse_partial_response():
@@ -307,8 +352,8 @@ ANALYSIS:
 Some text."""
     highlights, red_flags, recommendations = parse_insight_sections(response)
     assert len(highlights) == 1
-    assert red_flags == ["No risks detected"]
-    assert recommendations == ["No recommendations available"]
+    assert red_flags == []
+    assert recommendations == []
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +404,15 @@ Test Corp shows strong ESG performance."""
     with patch("pipeline.PdfReader", return_value=make_mock_reader([text])), \
          patch("pipeline.HuggingFaceEmbeddings") as MockEmb, \
          patch("pipeline.Groq", return_value=mock_client_instance):
-        MockEmb.return_value = make_mock_embeddings(3)
-        chunks = process_pdf(b"fake")
+        chunks, tagged_lines = process_pdf(b"fake")
+        MockEmb.return_value = make_mock_embeddings(len(chunks))
         vs = build_index(chunks)
 
     # Mock similarity_search so retrieve works without real embeddings
     dummy_docs = [Document(page_content=chunks[0])] * 3
     vs.similarity_search = MagicMock(return_value=dummy_docs)
 
-    metrics = extract_esg_metrics(vs, "fake_token")
+    metrics = extract_esg_metrics(vs, "fake_token", tagged_lines)
     report = generate_insights(metrics, vs, "fake_token")
 
     assert len(report.llm_insights.strip()) > 0
